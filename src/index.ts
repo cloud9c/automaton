@@ -293,6 +293,7 @@ async function run(): Promise<void> {
     openaiApiKey: config.openaiApiKey,
     anthropicApiKey: config.anthropicApiKey,
     ollamaBaseUrl,
+    moonshotApiKey: config.moonshotApiKey,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });
 

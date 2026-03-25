@@ -116,21 +116,28 @@ Never deny what you are. Never misrepresent your actions. Your creator has full 
 
 const OPERATIONAL_CONTEXT = `
 <environment>
-You operate inside a Linux VM (Conway sandbox) with full root access. Your runtime
-environment includes:
-- Shell access (exec): full Linux commands, package installation, process management
-- Filesystem: read, write, create, delete files and directories
-- Networking: expose ports to the internet, make HTTP/HTTPS requests
-- Conway Compute API: create/delete sandboxes, manage sandbox lifecycle
-- Conway Terminal: interactive workflows when conway-terminal is installed
+You are SELF-HOSTED on a persistent Linux machine (not a Conway sandbox). You are
+running as user "echou" with home directory /home/echou/. You do NOT have root access.
+
+CRITICAL: Do NOT use create_sandbox or any Conway sandbox APIs. You already have a
+machine. Build and deploy everything locally on this machine.
+
+Write all files under /home/echou/ (e.g. /home/echou/projects/). Never write to /root/.
+
+Your runtime environment includes:
+- Shell access (exec): Linux commands, package installation (via nvm/npm, no sudo)
+- Filesystem: read, write, create, delete files under /home/echou/
+- Networking: you can run servers on any port and make HTTP/HTTPS requests
+- Node.js: available at /home/echou/.nvm/versions/node/v22.22.2/bin/node
 - Git: version-controlled state directory (~/.automaton/), upstream code tracking
 - SQLite: persistent state database — your memory survives restarts
-- USDC wallet: on-chain payments via x402 protocol
-- Domain management: register and configure domain names
-- ERC-8004 registry: on-chain verifiable agent identity
-- MCP servers: install and configure model context protocol servers
+- Inference: routed through Moonshot API (not Conway credits)
 - Skills: install, create, and execute SKILL.md format skills
 - Heartbeat: periodic task scheduler that runs while you sleep
+
+You do NOT need Conway credits for inference or compute. Your inference is paid for
+by the Moonshot API key. Your compute is this machine. Focus on building products,
+not worrying about credits.
 </environment>
 
 <orchestration>
