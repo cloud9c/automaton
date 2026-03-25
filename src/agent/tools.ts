@@ -28,7 +28,7 @@ const logger = createLogger("tools");
 // ─── Path Confinement ─────────────────────────────────────────
 // write_file is restricted to the sandbox home directory tree.
 // The sandbox home is /root for both local and remote execution.
-const SANDBOX_HOME = "/root";
+const SANDBOX_HOME = "/home/echou";
 
 /**
  * Validate that a file path resolves to within the allowed root directory.
@@ -84,6 +84,11 @@ const FORBIDDEN_COMMAND_PATTERNS = [
   />\s*.*injection-defense/,
   />\s*.*self-mod\/code/,
   />\s*.*audit-log/,
+  // Other users' directories
+  /cd\s+\/home\/(?!echou)/,
+  /ls\s+\/home\/(?!echou)/,
+  /cat\s+\/home\/(?!echou)/,
+  /rm\s+.*\/home\/(?!echou)/,
   // Credential harvesting
   /cat\s+.*\.ssh/,
   /cat\s+.*\.gnupg/,
@@ -136,8 +141,10 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const forbidden = isForbiddenCommand(command, ctx.identity.sandboxId);
         if (forbidden) return forbidden;
 
+        // Confine execution to /home/echou
+        const confinedCommand = `cd /home/echou && ${command}`;
         const result = await ctx.conway.exec(
-          command,
+          confinedCommand,
           (args.timeout as number) || 30000,
         );
         return `exit_code: ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
@@ -213,7 +220,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
     {
       name: "expose_port",
       description:
-        "Expose a port from your sandbox to the internet. Returns a public URL.",
+        "Expose a local port to the internet via Cloudflare Tunnel. Returns a public URL. The tunnel runs in the background.",
       category: "vm",
       riskLevel: "caution",
       parameters: {
@@ -223,39 +230,65 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         },
         required: ["port"],
       },
-      execute: async (args, ctx) => {
-        const info = await ctx.conway.exposePort(args.port as number);
-        return `Port ${info.port} exposed at: ${info.publicUrl}`;
+      execute: async (args, _ctx) => {
+        const port = args.port as number;
+        const { execSync, spawn } = await import("child_process");
+        // Kill any existing tunnel on this port
+        try { execSync(`pkill -f "cloudflared.*--url.*:${port}"`, { encoding: "utf-8" }); } catch {}
+        // Start tunnel in background
+        const proc = spawn("cloudflared", ["tunnel", "--url", `http://localhost:${port}`], {
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        proc.unref();
+        // Wait for URL from stderr
+        return new Promise<string>((resolve) => {
+          let output = "";
+          const timeout = setTimeout(() => resolve(`Tunnel starting on port ${port}. Check logs for public URL.`), 15000);
+          proc.stderr?.on("data", (data: Buffer) => {
+            output += data.toString();
+            const match = output.match(/(https:\/\/[a-z0-9-]+\.trycloudflare\.com)/);
+            if (match) {
+              clearTimeout(timeout);
+              resolve(`Port ${port} exposed at: ${match[1]}`);
+            }
+          });
+        });
       },
     },
     {
       name: "remove_port",
-      description: "Remove a previously exposed port.",
+      description: "Stop the Cloudflare Tunnel for a previously exposed port.",
       category: "vm",
       riskLevel: "caution",
       parameters: {
         type: "object",
         properties: {
-          port: { type: "number", description: "Port number to remove" },
+          port: { type: "number", description: "Port number to stop exposing" },
         },
         required: ["port"],
       },
-      execute: async (args, ctx) => {
-        await ctx.conway.removePort(args.port as number);
-        return `Port ${args.port} removed`;
+      execute: async (args, _ctx) => {
+        const port = args.port as number;
+        const { execSync } = await import("child_process");
+        try {
+          execSync(`pkill -f "cloudflared.*--url.*:${port}"`, { encoding: "utf-8" });
+          return `Tunnel for port ${port} stopped.`;
+        } catch {
+          return `No tunnel found for port ${port}.`;
+        }
       },
     },
 
     // ── Conway API Tools ──
     {
       name: "check_credits",
-      description: "Check your current Conway compute credit balance.",
+      description: "Self-hosted mode: credits are not used. Do not call this tool. Focus on building products instead.",
       category: "conway",
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
-        const balance = await ctx.conway.getCreditsBalance();
-        return `Credit balance: $${(balance / 100).toFixed(2)} (${balance} cents)`;
+      execute: async (_args, _ctx) => {
+        return "Self-hosted mode: credits are not relevant. Your inference is paid by Moonshot API key and compute is your own machine. Stop checking credits and start building products.";
       },
     },
     {
@@ -276,7 +309,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
     {
       name: "topup_credits",
       description:
-        "Buy Conway compute credits by paying USDC from your wallet via x402. Valid tier amounts: $5, $25, $100, $500, $1000, $2500. Check your USDC balance first with check_usdc_balance.",
+        "Self-hosted mode: credits are not needed. Do not call this tool.",
       category: "financial",
       riskLevel: "caution",
       parameters: {
@@ -291,116 +324,77 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         required: ["amount_usd"],
       },
       execute: async (args, ctx) => {
-        // Solana guard: x402 topup is EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "Credit topup via x402 requires an EVM wallet. Solana automatons should fund credits via the Conway dashboard or credits API.";
-        }
-
-        const { topupCredits, TOPUP_TIERS } =
-          await import("../conway/topup.js");
-        const amountUsd = args.amount_usd as number;
-
-        if (!TOPUP_TIERS.includes(amountUsd)) {
-          return `Invalid tier. Valid amounts (USD): ${TOPUP_TIERS.join(", ")}`;
-        }
-
-        // Check USDC balance first (EVM-only path after Solana guard above)
-        const { getUsdcBalance } = await import("../conway/x402.js");
-        const usdcBalance = await getUsdcBalance(ctx.identity.address, "eip155:8453");
-        if (usdcBalance < amountUsd) {
-          return `Insufficient USDC. Balance: $${usdcBalance.toFixed(2)}, requested: $${amountUsd}. Choose a smaller tier or wait for funding.`;
-        }
-
-        const result = await topupCredits(
-          ctx.config.conwayApiUrl,
-          ctx.identity.account,
-          amountUsd,
-        );
-
-        if (!result.success) {
-          return `Credit topup failed: ${result.error}`;
-        }
-
-        // Record transaction
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "credit_purchase",
-          amountCents: amountUsd * 100,
-          balanceAfterCents: result.creditsCentsAdded,
-          description: `x402 credit topup: $${amountUsd} USD`,
-          timestamp: new Date().toISOString(),
-        });
-
-        return `Credit topup successful: +$${amountUsd} (${amountUsd * 100} cents) credits purchased via x402. Check your new balance with check_credits.`;
+        return "Self-hosted mode: you do not need credits. Your compute is free (your own machine) and inference is paid via Moonshot API key. Focus on building products.";
       },
     },
     {
       name: "create_sandbox",
       description:
-        "Create a new Conway sandbox (separate VM) for sub-tasks or testing.",
-      category: "conway",
+        "Create an isolated Docker container for sub-tasks or testing. Returns the container ID.",
+      category: "vm",
       riskLevel: "caution",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Sandbox name" },
-          vcpu: { type: "number", description: "vCPUs (default: 1)" },
-          memory_mb: {
-            type: "number",
-            description: "Memory in MB (default: 512)",
-          },
-          disk_gb: {
-            type: "number",
-            description: "Disk in GB (default: 5)",
-          },
+          name: { type: "string", description: "Container name" },
         },
       },
-      execute: async (args, ctx) => {
-        const info = await ctx.conway.createSandbox({
-          name: args.name as string,
-          vcpu: args.vcpu as number,
-          memoryMb: args.memory_mb as number,
-          diskGb: args.disk_gb as number,
-        });
-        return `Sandbox created: ${info.id} (${info.vcpu} vCPU, ${info.memoryMb}MB RAM)`;
+      execute: async (args, _ctx) => {
+        const name = (args.name as string) || `sandbox-${Date.now()}`;
+        const { execSync } = await import("child_process");
+        try {
+          const id = execSync(
+            `docker run -d --name ${name} -w /workspace node:22 tail -f /dev/null`,
+            { encoding: "utf-8" },
+          ).trim();
+          return `Container created: ${id.slice(0, 12)} (name: ${name}). Use exec to run commands inside it with: docker exec ${name} <command>`;
+        } catch (e: any) {
+          return `Failed to create container: ${e.message}`;
+        }
       },
     },
     {
       name: "delete_sandbox",
-      description: "Delete a sandbox. Note: sandbox deletion is currently disabled by the Conway API.",
-      category: "conway",
+      description: "Stop and remove a Docker container.",
+      category: "vm",
       riskLevel: "dangerous",
       parameters: {
         type: "object",
         properties: {
           sandbox_id: {
             type: "string",
-            description: "ID of sandbox to delete",
+            description: "Container name or ID to remove",
           },
         },
         required: ["sandbox_id"],
       },
-      execute: async () => {
-        return "Sandbox deletion is disabled. Sandboxes are prepaid and non-refundable.";
+      execute: async (args, _ctx) => {
+        const { execSync } = await import("child_process");
+        try {
+          execSync(`docker rm -f ${args.sandbox_id}`, { encoding: "utf-8" });
+          return `Container ${args.sandbox_id} removed.`;
+        } catch (e: any) {
+          return `Failed to remove container: ${e.message}`;
+        }
       },
     },
     {
       name: "list_sandboxes",
-      description: "List all your sandboxes.",
-      category: "conway",
+      description: "List all running Docker containers.",
+      category: "vm",
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
-        const sandboxes = await ctx.conway.listSandboxes();
-        if (sandboxes.length === 0) return "No sandboxes found.";
-        return sandboxes
-          .map(
-            (s) =>
-              `${s.id} [${s.status}] ${s.vcpu}vCPU/${s.memoryMb}MB ${s.region}`,
-          )
-          .join("\n");
+      execute: async (_args, _ctx) => {
+        const { execSync } = await import("child_process");
+        try {
+          const output = execSync(
+            'docker ps -a --format "{{.ID}} [{{.Status}}] {{.Names}} {{.Image}}"',
+            { encoding: "utf-8" },
+          ).trim();
+          return output || "No containers found.";
+        } catch (e: any) {
+          return `Failed to list containers: ${e.message}`;
+        }
       },
     },
 
@@ -2173,6 +2167,72 @@ Model: ${ctx.inference.getDefaultModel()}
 
     // ── Domain Tools ──
     {
+      name: "notify_creator",
+      description:
+        "Send a Telegram message to your creator. Use this to request help, report progress, ask for domains, or flag issues.",
+      category: "survival",
+      riskLevel: "safe",
+      parameters: {
+        type: "object",
+        properties: {
+          message: {
+            type: "string",
+            description: "Message to send to your creator",
+          },
+        },
+        required: ["message"],
+      },
+      execute: async (args, _ctx) => {
+        const message = args.message as string;
+        try {
+          const resp = await fetch(
+            `https://api.telegram.org/bot8513336521:AAFTYsJVETESf8V-OmZ8BIkGG8k-CTI-WVI/sendMessage`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: 5958267172,
+                text: `🤖 Investor:\n${message}`,
+                parse_mode: "HTML",
+              }),
+            },
+          );
+          if (!resp.ok) {
+            const err = await resp.text();
+            return `Failed to notify creator: ${err}`;
+          }
+          return "Message sent to creator via Telegram.";
+        } catch (e: any) {
+          return `Failed to notify creator: ${e.message}`;
+        }
+      },
+    },
+    {
+      name: "check_inbox",
+      description:
+        "Check for new Telegram messages from your creator. Use this periodically to see if your creator has sent you instructions, feedback, or responses.",
+      category: "survival",
+      riskLevel: "safe",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, _ctx) => {
+        try {
+          const resp = await fetch(
+            `https://api.telegram.org/bot8513336521:AAFTYsJVETESf8V-OmZ8BIkGG8k-CTI-WVI/getUpdates?offset=-10&limit=10`,
+          );
+          const data = await resp.json() as any;
+          if (!data.ok || !data.result?.length) return "No new messages from creator.";
+          const messages = data.result
+            .filter((u: any) => u.message?.chat?.id === 5958267172 && u.message?.text)
+            .map((u: any) => `[${new Date(u.message.date * 1000).toISOString()}] ${u.message.text}`)
+            .slice(-5);
+          if (messages.length === 0) return "No new messages from creator.";
+          return `Messages from creator:\n${messages.join("\n")}`;
+        } catch (e: any) {
+          return `Failed to check inbox: ${e.message}`;
+        }
+      },
+    },
+    {
       name: "search_domains",
       description: "Search for available domain names and get pricing.",
       category: "conway",
@@ -2210,9 +2270,9 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "register_domain",
       description:
-        "Register a domain name. Costs USDC via x402 payment. Check availability first with search_domains.",
+        "Request a domain registration from your creator. This sends a Telegram message asking them to register the domain for you. Use search_domains first to check availability.",
       category: "conway",
-      riskLevel: "dangerous",
+      riskLevel: "safe",
       parameters: {
         type: "object",
         properties: {
@@ -2220,19 +2280,32 @@ Model: ${ctx.inference.getDefaultModel()}
             type: "string",
             description: "Full domain to register (e.g., 'mysite.com')",
           },
-          years: {
-            type: "number",
-            description: "Registration period in years (default: 1)",
+          reason: {
+            type: "string",
+            description: "Why you need this domain",
           },
         },
         required: ["domain"],
       },
-      execute: async (args, ctx) => {
-        const reg = await ctx.conway.registerDomain(
-          args.domain as string,
-          (args.years as number) || 1,
-        );
-        return `Domain registered: ${reg.domain} (status: ${reg.status}${reg.expiresAt ? `, expires: ${reg.expiresAt}` : ""}${reg.transactionId ? `, tx: ${reg.transactionId}` : ""})`;
+      execute: async (args, _ctx) => {
+        const domain = args.domain as string;
+        const reason = (args.reason as string) || "No reason provided";
+        try {
+          await fetch(
+            `https://api.telegram.org/bot8513336521:AAFTYsJVETESf8V-OmZ8BIkGG8k-CTI-WVI/sendMessage`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: 5958267172,
+                text: `🤖 Investor wants a domain:\n\nDomain: ${domain}\nReason: ${reason}\n\nPlease register this domain and let me know.`,
+              }),
+            },
+          );
+          return `Domain registration request sent to creator via Telegram. Domain: ${domain}. Wait for creator to register it before proceeding with DNS setup.`;
+        } catch (e: any) {
+          return `Failed to notify creator: ${e.message}`;
+        }
       },
     },
     {
@@ -2726,7 +2799,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "x402_fetch",
       description:
-        "Fetch a URL with automatic x402 USDC payment. If the server responds with HTTP 402, signs a USDC payment and retries. Use this to access paid APIs and services.",
+        "Fetch a URL via HTTP. Makes a standard HTTP request (no payment protocol).",
       category: "financial",
       riskLevel: "dangerous",
       parameters: {
@@ -2752,14 +2825,6 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["url"],
       },
       execute: async (args, ctx) => {
-        // Solana guard: x402 payments are EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "x402 payment requires an EVM wallet. Solana automatons cannot sign EVM payment authorizations. Use Conway credits API instead.";
-        }
-
-        const { x402Fetch } = await import("../conway/x402.js");
-        const { DEFAULT_TREASURY_POLICY } = await import("../types.js");
         const url = args.url as string;
         const method = (args.method as string) || "GET";
         const body = args.body as string | undefined;
@@ -2767,32 +2832,23 @@ Model: ${ctx.inference.getDefaultModel()}
           ? JSON.parse(args.headers as string)
           : undefined;
 
-        const maxPayment =
-          ctx.config.treasuryPolicy?.maxX402PaymentCents ??
-          DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
-        const result = await x402Fetch(
-          url,
-          ctx.identity.account,
-          method,
-          body,
-          extraHeaders,
-          maxPayment,
-        );
-
-        if (!result.success) {
-          return `x402 fetch failed: ${result.error || "Unknown error"}`;
+        try {
+          const resp = await fetch(url, {
+            method,
+            body: body || undefined,
+            headers: { ...extraHeaders, "User-Agent": "automaton/0.2.1" },
+          });
+          const text = await resp.text();
+          if (!resp.ok) {
+            return `HTTP ${resp.status}: ${text.slice(0, 2000)}`;
+          }
+          if (text.length > 10000) {
+            return `Fetch succeeded (truncated):\n${text.slice(0, 10000)}...`;
+          }
+          return `Fetch succeeded:\n${text}`;
+        } catch (e: any) {
+          return `Fetch failed: ${e.message}`;
         }
-
-        const responseStr =
-          typeof result.response === "string"
-            ? result.response
-            : JSON.stringify(result.response, null, 2);
-
-        // Truncate very large responses
-        if (responseStr.length > 10000) {
-          return `x402 fetch succeeded (truncated):\n${responseStr.slice(0, 10000)}...`;
-        }
-        return `x402 fetch succeeded:\n${responseStr}`;
       },
     },
 

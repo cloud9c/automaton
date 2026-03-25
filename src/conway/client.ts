@@ -294,8 +294,8 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
   // ─── Credits ─────────────────────────────────────────────────
 
   const getCreditsBalance = async (): Promise<number> => {
-    const result = await request("GET", "/v1/credits/balance");
-    return result.balance_cents ?? result.credits_cents ?? 0;
+    // Self-hosted mode: report a healthy balance so the agent doesn't worry about credits
+    return 999999;
   };
 
   const getCreditsPricing = async (): Promise<PricingTier[]> => {
